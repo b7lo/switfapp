@@ -1,0 +1,143 @@
+workflows:
+  ios-adhoc:
+    name: MotionInsights iOS Ad-hoc Build
+    max_build_duration: 60
+    instance_type: mac_mini_m2
+
+    environment:
+      groups:
+        # Create these groups in Codemagic UI → Teams → Integrations → Environment variables.
+        # ios_signing must contain:
+        #   DIST_CERT_BASE64           (base64 of your .p12 distribution certificate)
+        #   DIST_CERT_PASSWORD         (password for the .p12)
+        #   PROVISIONING_PROFILE_BASE64 (base64 of your Ad-hoc .mobileprovision)
+        - ios_signing
+        # diawi must contain:
+        #   DIAWI_TOKEN                (your Diawi API token)
+        - diawi
+      vars:
+        XCODE_SCHEME: "MotionInsights"
+        BUNDLE_ID: "com.example.motioninsights"
+        EXPORT_METHOD: "ad-hoc"
+      xcode: latest
+
+    scripts:
+      - name: Install XcodeGen via Homebrew
+        script: |
+          set -euo pipefail
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          else
+            echo "XcodeGen already installed: $(xcodegen --version)"
+          fi
+
+      - name: Generate Xcode project from project.yml
+        script: |
+          set -euo pipefail
+          xcodegen generate
+          ls -la MotionInsights.xcodeproj
+
+      - name: Initialize keychain and import signing certificate
+        script: |
+          set -euo pipefail
+          keychain initialize
+
+          echo "$DIST_CERT_BASE64" | base64 --decode > /tmp/dist_cert.p12
+          keychain add-certificates \
+            --certificate /tmp/dist_cert.p12 \
+            --certificate-password "$DIST_CERT_PASSWORD"
+          rm -f /tmp/dist_cert.p12
+
+      - name: Install Ad-hoc provisioning profile
+        script: |
+          set -euo pipefail
+          PROFILES_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$PROFILES_DIR"
+          echo "$PROVISIONING_PROFILE_BASE64" | base64 --decode \
+            > "$PROFILES_DIR/adhoc.mobileprovision"
+
+          XCODE_PROJECT="MotionInsights.xcodeproj"
+          xcode-project use-profiles \
+            --project "$XCODE_PROJECT" \
+            --warn-only
+
+      - name: Set build number from Codemagic build counter
+        script: |
+          set -euo pipefail
+          agvtool new-version -all "$BUILD_NUMBER" || true
+
+      - name: Build IPA (Ad-hoc)
+        script: |
+          set -euo pipefail
+          XCODE_PROJECT="MotionInsights.xcodeproj"
+          xcode-project build-ipa \
+            --project "$XCODE_PROJECT" \
+            --scheme "$XCODE_SCHEME" \
+            --config Release \
+            --archive-xcargs "CODE_SIGN_STYLE=Manual"
+
+      - name: Upload IPA to Diawi
+        script: |
+          set -euo pipefail
+
+          IPA_FILE=$(find "$CM_BUILD_DIR" -maxdepth 6 -name "*.ipa" | head -n 1)
+          if [ -z "$IPA_FILE" ]; then
+            echo "❌ No IPA file found"
+            exit 1
+          fi
+          echo "📦 Uploading $IPA_FILE to Diawi..."
+
+          UPLOAD_RESPONSE=$(curl -sS https://upload.diawi.com/ \
+            -F token="$DIAWI_TOKEN" \
+            -F file=@"$IPA_FILE" \
+            -F find_by_udid=0 \
+            -F wall_of_apps=0)
+          echo "Upload response: $UPLOAD_RESPONSE"
+
+          JOB=$(echo "$UPLOAD_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('job',''))")
+          if [ -z "$JOB" ]; then
+            echo "❌ Diawi did not return a job id. Aborting."
+            exit 1
+          fi
+          echo "⏳ Polling Diawi job $JOB ..."
+
+          INSTALL_LINK=""
+          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            sleep 5
+            STATUS_RESPONSE=$(curl -sS "https://upload.diawi.com/status?token=$DIAWI_TOKEN&job=$JOB")
+            STATUS=$(echo "$STATUS_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))")
+            MESSAGE=$(echo "$STATUS_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message',''))")
+            echo "  attempt=$attempt status=$STATUS message=$MESSAGE"
+
+            if [ "$STATUS" = "2000" ]; then
+              HASH=$(echo "$STATUS_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('hash',''))")
+              INSTALL_LINK="https://i.diawi.com/$HASH"
+              break
+            fi
+            if [ "$STATUS" = "4000" ]; then
+              echo "❌ Diawi reported an error: $MESSAGE"
+              exit 1
+            fi
+          done
+
+          if [ -z "$INSTALL_LINK" ]; then
+            echo "❌ Diawi job did not finish within the timeout."
+            exit 1
+          fi
+
+          echo "✅ Diawi install link: $INSTALL_LINK"
+          echo "$INSTALL_LINK" > "$CM_BUILD_DIR/diawi_link.txt"
+
+    artifacts:
+      - "build/ios/ipa/*.ipa"
+      - "$CM_BUILD_DIR/build/ios/ipa/*.ipa"
+      - "$CM_BUILD_DIR/diawi_link.txt"
+      - "/tmp/xcodebuild_logs/*.log"
+
+    publishing:
+      email:
+        recipients:
+          - your-email@example.com
+        notify:
+          success: true
+          failure: true
