@@ -141,3 +141,36 @@ workflows:
         notify:
           success: true
           failure: true
+
+  ios-simulator:
+    name: MotionInsights Simulator Preview
+    max_build_duration: 30
+    instance_type: mac_mini_m2
+    environment:
+      vars:
+        XCODE_SCHEME: "MotionInsights"
+      xcode: latest
+    scripts:
+      - name: Install XcodeGen
+        script: |
+          set -euo pipefail
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          else
+            echo "XcodeGen already installed"
+          fi
+      - name: Generate Project
+        script: xcodegen generate
+      - name: Build for Simulator
+        script: |
+          set -euo pipefail
+          xcodebuild build \
+            -project "MotionInsights.xcodeproj" \
+            -scheme "$XCODE_SCHEME" \
+            -sdk iphonesimulator \
+            -configuration Debug \
+            -derivedDataPath build/derived_data \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+    artifacts:
+      - build/derived_data/**/*.app
